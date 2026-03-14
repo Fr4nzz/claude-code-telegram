@@ -312,7 +312,13 @@ class ClaudeSDKManager:
 
             # Use ResultMessage.result if available, fall back to message extraction
             if result_content is not None:
-                content = result_content
+                # Strip ThinkingBlock repr strings that leak into result text
+                import re
+                content = re.sub(
+                    r'\[ThinkingBlock\(thinking=\'.*?\',\s*signature=\'.*?\'\)\]\s*',
+                    '', result_content, flags=re.DOTALL
+                )
+                content = content.strip()
             else:
                 content_parts = []
                 for msg in messages:
@@ -426,6 +432,7 @@ class ClaudeSDKManager:
                 # Extract content from assistant message
                 content = getattr(message, "content", [])
                 text_parts = []
+                thinking_parts = []
                 tool_calls = []
 
                 if content and isinstance(content, list):
@@ -440,6 +447,20 @@ class ClaudeSDKManager:
                             )
                         elif hasattr(block, "text"):
                             text_parts.append(block.text)
+                        elif hasattr(block, "thinking"):
+                            # ThinkingBlock — Claude's extended reasoning
+                            thinking = getattr(block, "thinking", "")
+                            if thinking:
+                                thinking_parts.append(thinking)
+
+                # Send thinking as a separate event so the orchestrator
+                # can show it as a 🧠 message
+                if thinking_parts:
+                    thinking_update = StreamUpdate(
+                        type="thinking",
+                        content="\n".join(thinking_parts),
+                    )
+                    await stream_callback(thinking_update)
 
                 if text_parts or tool_calls:
                     update = StreamUpdate(
@@ -448,7 +469,7 @@ class ClaudeSDKManager:
                         tool_calls=tool_calls if tool_calls else None,
                     )
                     await stream_callback(update)
-                elif content:
+                elif content and not thinking_parts:
                     # Fallback for non-list content
                     update = StreamUpdate(
                         type="assistant",
