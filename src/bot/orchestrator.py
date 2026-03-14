@@ -995,10 +995,8 @@ class MessageOrchestrator:
                 except Exception:
                     logger.debug("Draft flush failed in finally block", user_id=user_id)
 
-        try:
-            await progress_msg.delete()
-        except Exception:
-            logger.debug("Failed to delete progress message, ignoring")
+        # Keep progress messages visible (don't delete)
+        pass
 
         # Use MCP-collected images (from send_image_to_user tool calls)
         images: List[ImageAttachment] = mcp_images
@@ -1411,10 +1409,8 @@ class MessageOrchestrator:
         formatter = ResponseFormatter(self.settings)
         formatted_messages = formatter.format_claude_response(claude_response.content)
 
-        try:
-            await progress_msg.delete()
-        except Exception:
-            logger.debug("Failed to delete progress message, ignoring")
+        # Keep progress messages visible (don't delete)
+        pass
 
         # Use MCP-collected images (from send_image_to_user tool calls).
         images: List[ImageAttachment] = mcp_images_media
