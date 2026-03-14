@@ -172,45 +172,15 @@ class ClaudeSDKManager:
                 stderr_lines.append(line)
                 logger.debug("Claude CLI stderr", line=line)
 
-            # Build system prompt, loading CLAUDE.md from working directory if present
-            base_prompt = (
-                f"All file operations must stay within {working_directory}. "
-                "Use relative paths."
-            )
-            claude_md_path = Path(working_directory) / "CLAUDE.md"
-            if claude_md_path.exists():
-                base_prompt += "\n\n" + claude_md_path.read_text(encoding="utf-8")
-                logger.info(
-                    "Loaded CLAUDE.md into system prompt",
-                    path=str(claude_md_path),
-                )
-
-            # When DISABLE_TOOL_VALIDATION=true, pass None for allowed/disallowed
-            # tools so the SDK does not restrict tool usage (e.g. MCP tools).
-            if self.config.disable_tool_validation:
-                sdk_allowed_tools = None
-                sdk_disallowed_tools = None
-            else:
-                sdk_allowed_tools = self.config.claude_allowed_tools
-                sdk_disallowed_tools = self.config.claude_disallowed_tools
-
-            # Build Claude Agent options
+            # Build Claude Agent options — unrestricted, matching vanilla Claude Code
             options = ClaudeAgentOptions(
                 max_turns=self.config.claude_max_turns,
                 model=self.config.claude_model or None,
-                max_budget_usd=self.config.claude_max_cost_per_request,
                 cwd=str(working_directory),
-                allowed_tools=sdk_allowed_tools,
-                disallowed_tools=sdk_disallowed_tools,
                 cli_path=self.config.claude_cli_path or None,
                 include_partial_messages=stream_callback is not None,
-                sandbox={
-                    "enabled": self.config.sandbox_enabled,
-                    "autoAllowBashIfSandboxed": True,
-                    "excludedCommands": self.config.sandbox_excluded_commands or [],
-                },
-                system_prompt=base_prompt,
-                setting_sources=["project"],
+                permission_mode="bypassPermissions",
+                setting_sources=["user", "project"],
                 stderr=_stderr_callback,
             )
 
@@ -220,14 +190,6 @@ class ClaudeSDKManager:
                 logger.info(
                     "MCP servers configured",
                     mcp_config_path=str(self.config.mcp_config_path),
-                )
-
-            # Wire can_use_tool callback for preventive tool validation
-            if self.security_validator:
-                options.can_use_tool = _make_can_use_tool_callback(
-                    security_validator=self.security_validator,
-                    working_directory=working_directory,
-                    approved_directory=self.config.approved_directory,
                 )
 
             # Resume previous session if we have a session_id
@@ -509,7 +471,19 @@ class ClaudeSDKManager:
 
             elif isinstance(message, UserMessage):
                 content = getattr(message, "content", "")
-                if content:
+                # Check if this is a tool result (list of ToolResultBlock)
+                raw_content = getattr(message, "content", None)
+                if isinstance(raw_content, list):
+                    for block in raw_content:
+                        if hasattr(block, "content") and hasattr(block, "tool_use_id"):
+                            # This is a ToolResultBlock
+                            result_text = str(getattr(block, "content", ""))
+                            update = StreamUpdate(
+                                type="tool_result",
+                                content=result_text,
+                            )
+                            await stream_callback(update)
+                elif content:
                     update = StreamUpdate(
                         type="user",
                         content=content,

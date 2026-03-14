@@ -550,29 +550,30 @@ class MessageOrchestrator:
         args = update.message.text.split()[1:] if update.message.text else []
         if not args:
             current = self._get_verbose_level(context)
-            labels = {0: "quiet", 1: "normal", 2: "detailed"}
+            labels = {0: "quiet", 1: "normal", 2: "detailed", 3: "full"}
             await update.message.reply_text(
                 f"Verbosity: <b>{current}</b> ({labels.get(current, '?')})\n\n"
-                "Usage: <code>/verbose 0|1|2</code>\n"
+                "Usage: <code>/verbose 0|1|2|3</code>\n"
                 "  0 = quiet (final response only)\n"
                 "  1 = normal (tools + reasoning)\n"
-                "  2 = detailed (tools with inputs + reasoning)",
+                "  2 = detailed (tools with inputs + reasoning)\n"
+                "  3 = full (commands + output, like vanilla Claude Code)",
                 parse_mode="HTML",
             )
             return
 
         try:
             level = int(args[0])
-            if level not in (0, 1, 2):
+            if level not in (0, 1, 2, 3):
                 raise ValueError
         except ValueError:
             await update.message.reply_text(
-                "Please use: /verbose 0, /verbose 1, or /verbose 2"
+                "Please use: /verbose 0, /verbose 1, /verbose 2, or /verbose 3"
             )
             return
 
         context.user_data["verbose_level"] = level
-        labels = {0: "quiet", 1: "normal", 2: "detailed"}
+        labels = {0: "quiet", 1: "normal", 2: "detailed", 3: "full (commands + output)"}
         await update.message.reply_text(
             f"Verbosity set to <b>{level}</b> ({labels[level]})",
             parse_mode="HTML",
@@ -591,18 +592,22 @@ class MessageOrchestrator:
         elapsed = time.time() - start_time
         lines: List[str] = [f"Working... ({elapsed:.0f}s)\n"]
 
-        for entry in activity_log[-15:]:  # Show last 15 entries max
+        max_entries = 30 if verbose_level >= 3 else 15
+        for entry in activity_log[-max_entries:]:
             kind = entry.get("kind", "tool")
             if kind == "text":
-                # Claude's intermediate reasoning/commentary
                 snippet = entry.get("detail", "")
-                if verbose_level >= 2:
+                if verbose_level >= 3:
+                    lines.append(f"\U0001f4ac {snippet}")
+                elif verbose_level >= 2:
                     lines.append(f"\U0001f4ac {snippet}")
                 else:
-                    # Level 1: one short line
                     lines.append(f"\U0001f4ac {snippet[:80]}")
+            elif kind == "result":
+                # Tool result (level 3 only)
+                result = entry.get("detail", "")
+                lines.append(f"  \u2514\u2500 {result[:300]}")
             else:
-                # Tool call
                 icon = _tool_icon(entry["name"])
                 if verbose_level >= 2 and entry.get("detail"):
                     lines.append(f"{icon} {entry['name']}: {entry['detail']}")
@@ -723,7 +728,19 @@ class MessageOrchestrator:
             if update_obj.tool_calls:
                 for tc in update_obj.tool_calls:
                     name = tc.get("name", "unknown")
-                    detail = self._summarize_tool_input(name, tc.get("input", {}))
+                    tool_input = tc.get("input", {})
+                    if verbose_level >= 3:
+                        # Full command/input display
+                        if name == "Bash":
+                            detail = tool_input.get("command", "")[:500]
+                        elif name in ("Read", "Write", "Edit"):
+                            detail = tool_input.get("file_path", "")
+                        elif name in ("Grep", "Glob"):
+                            detail = f'{tool_input.get("pattern", "")} in {tool_input.get("path", "")}'[:200]
+                        else:
+                            detail = str(tool_input)[:300]
+                    else:
+                        detail = self._summarize_tool_input(name, tool_input)
                     if verbose_level >= 1:
                         tool_log.append(
                             {"kind": "tool", "name": name, "detail": detail}
@@ -735,20 +752,39 @@ class MessageOrchestrator:
                         )
                         await draft_streamer.append_tool(line)
 
+            # Capture tool results at level 3
+            if verbose_level >= 3 and update_obj.type == "tool_result":
+                result_text = str(getattr(update_obj, "content", "") or "")[:500]
+                if result_text.strip():
+                    tool_log.append(
+                        {"kind": "result", "detail": result_text}
+                    )
+
             # Capture assistant text (reasoning / commentary)
             if update_obj.type == "assistant" and update_obj.content:
                 text = update_obj.content.strip()
                 if text:
-                    first_line = text.split("\n", 1)[0].strip()
-                    if first_line:
+                    if verbose_level >= 3:
+                        # Show full text at level 3
                         if verbose_level >= 1:
                             tool_log.append(
-                                {"kind": "text", "detail": first_line[:120]}
+                                {"kind": "text", "detail": text[:500]}
                             )
                         if draft_streamer:
                             await draft_streamer.append_tool(
-                                f"\U0001f4ac {first_line[:120]}"
+                                f"\U0001f4ac {text[:500]}"
                             )
+                    else:
+                        first_line = text.split("\n", 1)[0].strip()
+                        if first_line:
+                            if verbose_level >= 1:
+                                tool_log.append(
+                                    {"kind": "text", "detail": first_line[:120]}
+                                )
+                            if draft_streamer:
+                                await draft_streamer.append_tool(
+                                    f"\U0001f4ac {first_line[:120]}"
+                                )
 
             # Stream text to user via draft (prefer token deltas;
             # skip full assistant messages to avoid double-appending)
