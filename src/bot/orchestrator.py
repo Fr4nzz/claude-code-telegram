@@ -1321,7 +1321,14 @@ class MessageOrchestrator:
                 voice, update.message.caption
             )
 
-            await progress_msg.edit_text("Working...")
+            # Show transcription to user
+            transcript_display = processed_voice.transcription
+            if len(transcript_display) > 4000:
+                transcript_display = transcript_display[:4000] + "…"
+            await progress_msg.edit_text(f'🎤 "{transcript_display}"')
+
+            # Send a new progress message for Claude's response
+            progress_msg = await update.message.reply_text("Working...")
             await self._handle_agentic_media_message(
                 update=update,
                 context=context,

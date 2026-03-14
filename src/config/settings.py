@@ -169,9 +169,9 @@ class Settings(BaseSettings):
     enable_voice_messages: bool = Field(
         True, description="Enable voice message transcription"
     )
-    voice_provider: Literal["mistral", "openai"] = Field(
-        "mistral",
-        description="Voice transcription provider: 'mistral' or 'openai'",
+    voice_provider: Literal["gemini", "mistral", "openai"] = Field(
+        "gemini",
+        description="Voice transcription provider: 'gemini', 'mistral', or 'openai'",
     )
     mistral_api_key: Optional[SecretStr] = Field(
         None, description="Mistral API key for voice transcription"
@@ -393,10 +393,10 @@ class Settings(BaseSettings):
     def validate_voice_provider(cls, v: Any) -> str:
         """Validate and normalize voice transcription provider."""
         if v is None:
-            return "mistral"
+            return "gemini"
         provider = str(v).strip().lower()
-        if provider not in {"mistral", "openai"}:
-            raise ValueError("voice_provider must be one of ['mistral', 'openai']")
+        if provider not in {"gemini", "mistral", "openai"}:
+            raise ValueError("voice_provider must be one of ['gemini', 'mistral', 'openai']")
         return provider
 
     @field_validator("project_threads_chat_id", mode="before")
@@ -503,6 +503,8 @@ class Settings(BaseSettings):
             return self.voice_transcription_model
         if self.voice_provider == "openai":
             return "whisper-1"
+        if self.voice_provider == "gemini":
+            return "gemini-3.1-flash-lite-preview"
         return "voxtral-mini-latest"
 
     @property
@@ -515,6 +517,8 @@ class Settings(BaseSettings):
         """API key environment variable required for the configured voice provider."""
         if self.voice_provider == "openai":
             return "OPENAI_API_KEY"
+        if self.voice_provider == "gemini":
+            return ""  # No API key needed
         return "MISTRAL_API_KEY"
 
     @property
@@ -522,4 +526,6 @@ class Settings(BaseSettings):
         """Human-friendly label for the configured voice provider."""
         if self.voice_provider == "openai":
             return "OpenAI Whisper"
+        if self.voice_provider == "gemini":
+            return "Gemini Flash Lite"
         return "Mistral Voxtral"

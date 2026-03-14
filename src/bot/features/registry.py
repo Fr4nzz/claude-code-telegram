@@ -78,8 +78,10 @@ class FeatureRegistry:
         except Exception as e:
             logger.error("Failed to initialize image handler", error=str(e))
 
-        # Voice transcription - requires provider-specific API key
+        # Voice transcription - Gemini needs no API key, others need provider key
         voice_key_available = (
+            self.config.voice_provider == "gemini"
+        ) or (
             self.config.voice_provider == "openai" and self.config.openai_api_key
         ) or (self.config.voice_provider == "mistral" and self.config.mistral_api_key)
         if self.config.enable_voice_messages and voice_key_available:

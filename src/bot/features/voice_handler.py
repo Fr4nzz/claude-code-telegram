@@ -1,7 +1,10 @@
-"""Handle voice message transcription via Mistral (Voxtral) or OpenAI (Whisper)."""
+"""Handle voice message transcription via Gemini, Mistral (Voxtral), or OpenAI (Whisper)."""
 
+import asyncio
+import tempfile
 from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
 from typing import Any, Optional
 
 import structlog
@@ -79,7 +82,9 @@ class VoiceHandler:
             file_size=initial_file_size or resolved_file_size or len(voice_bytes),
         )
 
-        if self.config.voice_provider == "openai":
+        if self.config.voice_provider == "gemini":
+            transcription = await self._transcribe_gemini(voice_bytes)
+        elif self.config.voice_provider == "openai":
             transcription = await self._transcribe_openai(voice_bytes)
         else:
             transcription = await self._transcribe_mistral(voice_bytes)
@@ -102,6 +107,31 @@ class VoiceHandler:
             transcription=transcription,
             duration=duration_secs,
         )
+
+    async def _transcribe_gemini(self, voice_bytes: bytes) -> str:
+        """Transcribe audio using Gemini via the local gemini CLI."""
+        # Write voice bytes to a temp file
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f:
+            f.write(voice_bytes)
+            temp_path = f.name
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "/home/ubuntu/.local/bin/gemini", "prompt",
+                "Transcribe this audio accurately. Output ONLY the transcript text, preserving the original language.",
+                "-f", temp_path,
+                "--model", "gemini-3.1-flash-lite-preview",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+            if proc.returncode != 0 or not stdout.strip():
+                error_msg = stderr.decode().strip()[:200] if stderr else f"exit code {proc.returncode}"
+                logger.warning("Gemini transcription failed", error=error_msg)
+                raise RuntimeError(f"Gemini transcription failed: {error_msg}")
+            return stdout.decode().strip()
+        finally:
+            Path(temp_path).unlink(missing_ok=True)
 
     async def _transcribe_mistral(self, voice_bytes: bytes) -> str:
         """Transcribe audio using the Mistral API (Voxtral)."""
