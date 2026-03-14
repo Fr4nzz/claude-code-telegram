@@ -34,8 +34,10 @@ from ..projects import PrivateTopicsUnavailableError
 from .utils.draft_streamer import DraftStreamer, generate_draft_id
 from .utils.html_format import escape_html
 from .utils.image_extractor import (
+    FileAttachment,
     ImageAttachment,
     should_send_as_photo,
+    validate_file_path,
     validate_image_path,
 )
 
@@ -324,10 +326,11 @@ class MessageOrchestrator:
             group=10,
         )
 
-        # File uploads -> Claude
+        # File uploads -> Claude (documents, audio files, video files)
         app.add_handler(
             MessageHandler(
-                filters.Document.ALL, self._inject_deps(self.agentic_document)
+                filters.Document.ALL | filters.AUDIO | filters.VIDEO,
+                self._inject_deps(self.agentic_document),
             ),
             group=10,
         )
@@ -682,7 +685,7 @@ class MessageOrchestrator:
         """Create a stream callback for verbose progress updates.
 
         When *mcp_images* is provided, the callback also intercepts
-        ``send_image_to_user`` tool calls and collects validated
+        ``send_file_to_user`` tool calls and collects validated
         :class:`ImageAttachment` objects for later Telegram delivery.
 
         When *draft_streamer* is provided, tool activity and assistant
@@ -701,23 +704,23 @@ class MessageOrchestrator:
         last_edit_time = [0.0]  # mutable container for closure
 
         async def _on_stream(update_obj: StreamUpdate) -> None:
-            # Intercept send_image_to_user MCP tool calls.
+            # Intercept send_file_to_user / send_image_to_user MCP tool calls.
             # The SDK namespaces MCP tools as "mcp__<server>__<tool>",
             # so match both the bare name and the namespaced variant.
             if update_obj.tool_calls and need_mcp_intercept:
                 for tc in update_obj.tool_calls:
                     tc_name = tc.get("name", "")
-                    if tc_name == "send_image_to_user" or tc_name.endswith(
-                        "__send_image_to_user"
+                    if tc_name in ("send_file_to_user", "send_image_to_user") or tc_name.endswith(
+                        ("__send_file_to_user", "__send_image_to_user")
                     ):
                         tc_input = tc.get("input", {})
                         file_path = tc_input.get("file_path", "")
                         caption = tc_input.get("caption", "")
-                        img = validate_image_path(
+                        attachment = validate_file_path(
                             file_path, approved_directory, caption
                         )
-                        if img:
-                            mcp_images.append(img)
+                        if attachment:
+                            mcp_images.append(attachment)
 
             # Capture tool calls
             if update_obj.tool_calls:
@@ -1000,7 +1003,7 @@ class MessageOrchestrator:
         except Exception:
             logger.debug("Failed to delete progress message, ignoring")
 
-        # Use MCP-collected images (from send_image_to_user tool calls)
+        # Use MCP-collected files (from send_file_to_user tool calls)
         images: List[ImageAttachment] = mcp_images
 
         # Try to combine text + images in one message when possible
@@ -1083,69 +1086,70 @@ class MessageOrchestrator:
     async def agentic_document(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Process file upload -> Claude, minimal chrome."""
+        """Process file upload -> Claude, minimal chrome.
+
+        Downloads the file to /tmp/telegram-uploads/ and passes the local
+        path to Claude so it can read the file during the session. The file
+        is intentionally kept on disk after the response.
+        """
         user_id = update.effective_user.id
-        document = update.message.document
+        msg = update.message
+
+        # Unified handling: document, audio, or video attachments
+        document = msg.document or msg.audio or msg.video
+        if not document:
+            await msg.reply_text("No file detected in this message.")
+            return
+
+        file_name_raw = getattr(document, "file_name", None)
 
         logger.info(
             "Agentic document upload",
             user_id=user_id,
-            filename=document.file_name,
+            filename=file_name_raw,
         )
 
         # Security validation
         security_validator = context.bot_data.get("security_validator")
-        if security_validator:
-            valid, error = security_validator.validate_filename(document.file_name)
+        if security_validator and file_name_raw:
+            valid, error = security_validator.validate_filename(file_name_raw)
             if not valid:
-                await update.message.reply_text(f"File rejected: {error}")
+                await msg.reply_text(f"File rejected: {error}")
                 return
 
         # Size check
         max_size = 10 * 1024 * 1024
-        if document.file_size > max_size:
-            await update.message.reply_text(
+        if document.file_size and document.file_size > max_size:
+            await msg.reply_text(
                 f"File too large ({document.file_size / 1024 / 1024:.1f}MB). Max: 10MB."
             )
             return
 
-        chat = update.message.chat
+        chat = msg.chat
         await chat.send_action("typing")
-        progress_msg = await update.message.reply_text("Working...")
+        progress_msg = await msg.reply_text("Working...")
 
-        # Try enhanced file handler, fall back to basic
-        features = context.bot_data.get("features")
-        file_handler = features.get_file_handler() if features else None
-        prompt: Optional[str] = None
+        # Download file to /tmp/telegram-uploads/ so Claude can read it
+        upload_dir = Path("/tmp/telegram-uploads")
+        upload_dir.mkdir(parents=True, exist_ok=True)
 
-        if file_handler:
-            try:
-                processed_file = await file_handler.handle_document_upload(
-                    document,
-                    user_id,
-                    update.message.caption or "Please review this file:",
-                )
-                prompt = processed_file.prompt
-            except Exception:
-                file_handler = None
+        file_name = file_name_raw or f"file_{document.file_unique_id}"
+        dest_path = upload_dir / file_name
 
-        if not file_handler:
-            file = await document.get_file()
-            file_bytes = await file.download_as_bytearray()
-            try:
-                content = file_bytes.decode("utf-8")
-                if len(content) > 50000:
-                    content = content[:50000] + "\n... (truncated)"
-                caption = update.message.caption or "Please review this file:"
-                prompt = (
-                    f"{caption}\n\n**File:** `{document.file_name}`\n\n"
-                    f"```\n{content}\n```"
-                )
-            except UnicodeDecodeError:
-                await progress_msg.edit_text(
-                    "Unsupported file format. Must be text-based (UTF-8)."
-                )
-                return
+        # Avoid collisions by appending a suffix
+        if dest_path.exists():
+            stem = dest_path.stem
+            suffix = dest_path.suffix
+            counter = 1
+            while dest_path.exists():
+                dest_path = upload_dir / f"{stem}_{counter}{suffix}"
+                counter += 1
+
+        tg_file = await document.get_file()
+        await tg_file.download_to_drive(str(dest_path))
+
+        caption = update.message.caption or "El usuario envio este archivo"
+        prompt = f"[Archivo adjunto: {dest_path}]\n\n{caption}"
 
         # Process with Claude
         claude_integration = context.bot_data.get("claude_integration")
@@ -1210,7 +1214,7 @@ class MessageOrchestrator:
             except Exception:
                 logger.debug("Failed to delete progress message, ignoring")
 
-            # Use MCP-collected images (from send_image_to_user tool calls)
+            # Use MCP-collected files (from send_file_to_user tool calls)
             images: List[ImageAttachment] = mcp_images_doc
 
             caption_sent = False
@@ -1409,7 +1413,7 @@ class MessageOrchestrator:
         except Exception:
             logger.debug("Failed to delete progress message, ignoring")
 
-        # Use MCP-collected images (from send_image_to_user tool calls).
+        # Use MCP-collected files (from send_file_to_user tool calls).
         images: List[ImageAttachment] = mcp_images_media
 
         caption_sent = False
