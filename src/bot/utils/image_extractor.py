@@ -71,16 +71,21 @@ def validate_file_path(
 
         resolved = path.resolve()
 
-        # Security: must be within approved directory
+        # Security: must be within approved directory or /tmp
+        approved_resolved = approved_directory.resolve()
+        tmp_dir = Path("/tmp").resolve()
         try:
-            resolved.relative_to(approved_directory.resolve())
+            resolved.relative_to(approved_resolved)
         except ValueError:
-            logger.debug(
-                "MCP file path outside approved directory",
-                path=str(resolved),
-                approved=str(approved_directory),
-            )
-            return None
+            try:
+                resolved.relative_to(tmp_dir)
+            except ValueError:
+                logger.debug(
+                    "MCP file path outside approved directory",
+                    path=str(resolved),
+                    approved=str(approved_resolved),
+                )
+                return None
 
         if not resolved.is_file():
             return None

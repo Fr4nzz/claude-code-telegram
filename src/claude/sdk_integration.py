@@ -164,7 +164,7 @@ class ClaudeSDKManager:
                 cli_path=self.config.claude_cli_path or None,
                 include_partial_messages=stream_callback is not None,
                 permission_mode="bypassPermissions",
-                setting_sources=["user", "project"],
+                setting_sources=["project"],
                 stderr=_stderr_callback,
             )
 

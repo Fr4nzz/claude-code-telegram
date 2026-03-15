@@ -112,6 +112,10 @@ class DraftStreamer:
         if (now - self._last_send_time) >= self.throttle_interval:
             await self._send_draft()
 
+    def reset_text(self) -> None:
+        """Reset accumulated text (call after text was shown via a 💬 message)."""
+        self._accumulated_text = ""
+
     async def flush(self) -> None:
         """Force-send the current accumulated text as a draft."""
         if not self._enabled:

@@ -756,6 +756,7 @@ class MessageOrchestrator:
         tool_log.append({"_tool_message_ids": tool_message_ids})
         last_tool_msg_id: List[Optional[int]] = [None]  # track last tool msg for result appending
         last_edit_time = [0.0]  # mutable container for throttled progress edits
+        has_used_tools = [False]  # track whether any tool calls were seen
 
         async def _send_tool_msg(text: str) -> Optional[int]:
             """Send a tool status message and track its ID."""
@@ -842,6 +843,8 @@ class MessageOrchestrator:
                             mcp_images.append(attachment)
 
             # Send per-event messages for tool calls
+            if update_obj.tool_calls:
+                has_used_tools[0] = True
             if update_obj.tool_calls and verbose_level >= 1:
                 for tc in update_obj.tool_calls:
                     name = tc.get("name", "unknown")
@@ -885,15 +888,21 @@ class MessageOrchestrator:
                         tool_log.append({"kind": "text", "detail": f"🧠 {first_line}"})
 
             # Assistant text (visible reasoning / commentary)
+            # Only show 💬 when tools have been used (intermediate thinking).
+            # For pure text responses, skip — the final formatted message
+            # will show the same text.
             if update_obj.type == "assistant" and update_obj.content:
                 text = update_obj.content.strip()
                 if text and "[ThinkingBlock(" in text:
                     text = ""
-                if text and verbose_level >= 1:
+                if text and verbose_level >= 1 and has_used_tools[0]:
                     first_line = text.split("\n", 1)[0].strip()[:200]
                     if first_line:
                         await _send_tool_msg(f"💬 {first_line}")
                         tool_log.append({"kind": "text", "detail": first_line})
+                        # Reset draft so it only shows NEW text going forward
+                        if draft_streamer:
+                            draft_streamer.reset_text()
 
             # Stream response text to user via draft (live typing preview).
             # The draft is temporary (vanishes when next real message arrives)
@@ -1251,6 +1260,13 @@ class MessageOrchestrator:
                 except Exception as img_err:
                     logger.warning("Image+caption send failed", error=str(img_err))
 
+        # Clear the draft streamer before sending final response
+        if draft_streamer:
+            try:
+                await draft_streamer.clear()
+            except Exception:
+                pass
+
         # Send response FIRST (so it appears before draft disappears)
         if not caption_sent:
             for i, message in enumerate(formatted_messages):
@@ -1275,15 +1291,15 @@ class MessageOrchestrator:
                 except Exception as img_err:
                     logger.warning("Image send failed", error=str(img_err))
 
-        # Finalize progress message AFTER response is sent (no gap)
+        # Update progress message with final elapsed time
         elapsed = int(time.time() - start_time)
         try:
-            await progress_msg.edit_text(f"✅ Done ({elapsed}s)")
+            await progress_msg.edit_text(f"⏱ {elapsed}s")
         except Exception:
             pass
 
         # Save tool message IDs for /cleanup command
-        all_tool_msg_ids = [progress_msg.message_id]
+        all_tool_msg_ids: List[int] = []
         for entry in tool_log:
             ids = entry.get("_tool_message_ids")
             if ids:
@@ -1454,6 +1470,13 @@ class MessageOrchestrator:
                 await progress_msg.delete()
             except Exception:
                 logger.debug("Failed to delete progress message, ignoring")
+
+            # Clear draft streamer before final response
+            if draft_streamer_doc:
+                try:
+                    await draft_streamer_doc.clear()
+                except Exception:
+                    pass
 
             # Use MCP-collected files (from send_file_to_user tool calls)
             images: List[ImageAttachment] = mcp_images_doc
@@ -1691,6 +1714,13 @@ class MessageOrchestrator:
 
         # Keep progress messages visible (don't delete)
         pass
+
+        # Clear draft streamer before final response
+        if draft_streamer_media:
+            try:
+                await draft_streamer_media.clear()
+            except Exception:
+                pass
 
         # Use MCP-collected files (from send_file_to_user tool calls).
         images: List[ImageAttachment] = mcp_images_media
