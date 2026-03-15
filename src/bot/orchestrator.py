@@ -614,6 +614,13 @@ class MessageOrchestrator:
         """Stop the currently running Claude task: /stop."""
         task = context.user_data.get("running_claude_task")
         if task and not task.done():
+            # Kill the Claude CLI subprocess first
+            claude_integration = context.bot_data.get("claude_integration")
+            if claude_integration:
+                sdk_manager = getattr(claude_integration, "sdk_manager", None)
+                if sdk_manager:
+                    await sdk_manager.abort()
+            # Then cancel the asyncio task
             task.cancel()
             context.user_data["running_claude_task"] = None
             await update.message.reply_text("⛔ Stopped.")
@@ -1053,6 +1060,39 @@ class MessageOrchestrator:
             message_length=len(message_text),
         )
 
+        # If Claude is currently processing, interrupt and send follow-up
+        running_task = context.user_data.get("running_claude_task")
+        if running_task and not running_task.done():
+            claude_integration = context.bot_data.get("claude_integration")
+            if claude_integration:
+                sdk_manager = getattr(claude_integration, "sdk_manager", None)
+                if sdk_manager and sdk_manager.is_processing:
+                    logger.info(
+                        "Follow-up message during processing, interrupting",
+                        user_id=user_id,
+                    )
+                    await update.message.reply_text(
+                        f"📨 Interrupting... {message_text[:80]}"
+                    )
+                    # 1. Send interrupt signal (like Ctrl+C)
+                    await sdk_manager.interrupt()
+                    # 2. Give it 3 seconds to stop gracefully
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(running_task), timeout=3.0
+                        )
+                    except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                        # 3. Didn't stop — forcefully kill the subprocess
+                        logger.info("Interrupt didn't stop in time, aborting")
+                        await sdk_manager.abort()
+                        running_task.cancel()
+                        try:
+                            await running_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                    context.user_data["running_claude_task"] = None
+                    # Fall through to process this message as a continuation
+
         # Rate limit check
         rate_limiter = context.bot_data.get("rate_limiter")
         if rate_limiter:
@@ -1375,8 +1415,10 @@ class MessageOrchestrator:
         )
 
         heartbeat = self._start_typing_heartbeat(chat)
-        try:
-            claude_response = await claude_integration.run_command(
+
+        # Track the running task so follow-up messages can interrupt it
+        run_task = asyncio.ensure_future(
+            claude_integration.run_command(
                 prompt=prompt,
                 working_directory=current_dir,
                 user_id=user_id,
@@ -1384,6 +1426,11 @@ class MessageOrchestrator:
                 on_stream=on_stream,
                 force_new=force_new,
             )
+        )
+        context.user_data["running_claude_task"] = run_task
+
+        try:
+            claude_response = await run_task
 
             if force_new:
                 context.user_data["force_new_session"] = False
@@ -1456,6 +1503,7 @@ class MessageOrchestrator:
             logger.error("Claude file processing failed", error=str(e), user_id=user_id)
         finally:
             heartbeat.cancel()
+            context.user_data["running_claude_task"] = None
 
     async def agentic_photo(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1605,8 +1653,10 @@ class MessageOrchestrator:
         )
 
         heartbeat = self._start_typing_heartbeat(chat)
-        try:
-            claude_response = await claude_integration.run_command(
+
+        # Track the running task so follow-up messages can interrupt it
+        run_task = asyncio.ensure_future(
+            claude_integration.run_command(
                 prompt=prompt,
                 working_directory=current_dir,
                 user_id=user_id,
@@ -1614,8 +1664,14 @@ class MessageOrchestrator:
                 on_stream=on_stream,
                 force_new=force_new,
             )
+        )
+        context.user_data["running_claude_task"] = run_task
+
+        try:
+            claude_response = await run_task
         finally:
             heartbeat.cancel()
+            context.user_data["running_claude_task"] = None
 
         if force_new:
             context.user_data["force_new_session"] = False
